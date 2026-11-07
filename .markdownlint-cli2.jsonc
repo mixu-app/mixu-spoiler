@@ -15,6 +15,7 @@
     "**/*.md"
   ],
   "ignores": [
+    "libs",
     ".carryctx",
     ".git",
     ".worktrees",
