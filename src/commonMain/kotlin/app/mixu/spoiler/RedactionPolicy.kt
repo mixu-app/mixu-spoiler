@@ -4,10 +4,14 @@ package app.mixu.spoiler
 import app.mixu.graph.Assertion
 import app.mixu.graph.AssertionTransition
 import app.mixu.graph.Entity
+import app.mixu.graph.EntityId
 import app.mixu.graph.EntityName
+import app.mixu.graph.GraphPack
+import app.mixu.graph.IdentityLink
 import app.mixu.graph.ObjectRef
 import app.mixu.graph.RevealedAssertion
 import app.mixu.graph.RevealedEntity
+import app.mixu.graph.RevealedGraphView
 
 /**
  * Filter decision on whether an item is visible or redacted.
@@ -84,6 +88,7 @@ object RedactionPolicy {
         subject: Entity,
         objectEntity: Entity?,
         horizon: Horizon,
+        speaker: Entity? = null,
     ): RedactionResult<RevealedAssertion> {
         val viewOrdinal = horizon.graphViewPosition.value
 
@@ -97,6 +102,18 @@ object RedactionPolicy {
 
         if (assertion.objectRef is ObjectRef.Entity) {
             if (objectEntity == null || objectEntity.firstReveal > viewOrdinal) {
+                return RedactionResult.Redacted
+            }
+        }
+
+        if (assertion.attribution.speakerId != null) {
+            val resolvedSpeaker =
+                if (assertion.attribution.speakerId == subject.entityId) {
+                    subject
+                } else {
+                    speaker
+                }
+            if (resolvedSpeaker == null || resolvedSpeaker.firstReveal > viewOrdinal) {
                 return RedactionResult.Redacted
             }
         }
@@ -117,6 +134,105 @@ object RedactionPolicy {
                 activeTransition = activeTransition,
                 viewOrdinal = viewOrdinal,
             ),
+        )
+    }
+
+    /**
+     * Evaluates whether an identity link is visible at the current horizon.
+     */
+    fun evaluateIdentityLink(
+        link: IdentityLink,
+        horizon: Horizon,
+    ): RedactionResult<IdentityLink> {
+        val viewOrdinal = horizon.graphViewPosition.value
+        if (link.firstReveal > viewOrdinal) {
+            return RedactionResult.Redacted
+        }
+        return RedactionResult.Visible(link)
+    }
+
+    /**
+     * Resolves the canonical entity ID among linked personas at the current horizon.
+     * Before the link's firstReveal ordinal, the entities remain isolated and each resolves to itself.
+     */
+    fun resolveCanonicalEntityId(
+        entityId: EntityId,
+        links: List<IdentityLink>,
+        horizon: Horizon,
+    ): EntityId {
+        val viewOrdinal = horizon.graphViewPosition.value
+        val validLinks =
+            links.filter {
+                it.firstReveal <= viewOrdinal && it.entityIds.contains(entityId)
+            }
+        if (validLinks.isEmpty()) return entityId
+
+        val connected = mutableSetOf(entityId)
+        val queue = ArrayDeque<EntityId>()
+        queue.add(entityId)
+        while (queue.isNotEmpty()) {
+            val curr = queue.removeFirst()
+            for (link in links) {
+                if (link.firstReveal <= viewOrdinal && link.entityIds.contains(curr)) {
+                    for (other in link.entityIds) {
+                        if (connected.add(other)) {
+                            queue.add(other)
+                        }
+                    }
+                }
+            }
+        }
+        return connected.minByOrNull { it.value } ?: entityId
+    }
+
+    /**
+     * Evaluates a full GraphPack under the given [Horizon], enforcing all spoiler firewall invariants.
+     */
+    fun evaluateGraphPack(
+        pack: GraphPack,
+        links: List<IdentityLink> = emptyList(),
+        horizon: Horizon,
+    ): RevealedGraphView {
+        val viewOrdinal = horizon.graphViewPosition.value
+        val entityMap = pack.entities.associateBy { it.entityId }
+
+        val visibleEntities = mutableListOf<RevealedEntity>()
+        for (entity in pack.entities) {
+            when (val eval = evaluateEntity(entity, pack.names, horizon)) {
+                is RedactionResult.Visible -> visibleEntities.add(eval.item)
+                RedactionResult.Redacted -> Unit
+            }
+        }
+        visibleEntities.sortWith(RevealedEntity.STABLE_COMPARATOR)
+
+        val visibleAssertions = mutableListOf<RevealedAssertion>()
+        for (assertion in pack.assertions) {
+            val subject = entityMap[assertion.subjectId] ?: continue
+            val objectEntity =
+                (assertion.objectRef as? ObjectRef.Entity)?.let { entityMap[it.entityId] }
+            val speaker = assertion.attribution.speakerId?.let { entityMap[it] }
+
+            val eval =
+                evaluateAssertion(
+                    assertion = assertion,
+                    transitions = pack.transitions,
+                    subject = subject,
+                    objectEntity = objectEntity,
+                    horizon = horizon,
+                    speaker = speaker,
+                )
+            when (eval) {
+                is RedactionResult.Visible -> visibleAssertions.add(eval.item)
+                RedactionResult.Redacted -> Unit
+            }
+        }
+        visibleAssertions.sortWith(RevealedAssertion.STABLE_COMPARATOR)
+
+        return RevealedGraphView(
+            editionId = pack.manifest.editionId,
+            viewOrdinal = viewOrdinal,
+            entities = visibleEntities,
+            assertions = visibleAssertions,
         )
     }
 
