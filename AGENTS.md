@@ -54,7 +54,7 @@ authorization system.
 ## Gates
 
 ```sh
-just check      # markdownlint + gradle (phase exception until wrapper lands)
+just check      # markdownlint + gradle check
 ```
 
 A gate that cannot run fails loudly. A missing or broken tool runs from the pinned
