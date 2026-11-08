@@ -1,6 +1,6 @@
 # Design: knowledge-horizon filtering
 
-Status: **Proposed** · Owner: mixu-core · Consumes: `mixu-graph` model, `mixu-contracts`
+Status: **Active** · Owner: mixu-core · Consumes: `mixu-graph` model, `mixu-contracts`
 
 ## Threat model
 
