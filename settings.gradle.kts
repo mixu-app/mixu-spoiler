@@ -23,4 +23,6 @@ dependencyResolutionManagement {
     }
 }
 
-includeBuild("libs/mixu-graph")
+if (gradle.parent == null) {
+    includeBuild("libs/mixu-graph")
+}
