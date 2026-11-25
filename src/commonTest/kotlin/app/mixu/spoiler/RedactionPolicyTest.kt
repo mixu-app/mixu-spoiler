@@ -446,4 +446,161 @@ class RedactionPolicyTest {
         val holmesView = fullView.entities.find { it.entity.entityId == holmes }
         assertNull(holmesView?.allRevealedNames?.find { it.nameId == holmesCanonical })
     }
+
+    @Test
+    fun adr043HypothesisFrameTextWorkSpeakerAndMotifRemainStrictlyGated() {
+        val gEdition = app.mixu.graph.EditionId(editionId.value)
+        val checksum = "0123456789abcdef".repeat(4)
+        val manifest =
+            GraphPackManifest(
+                graphSchemaVersion = 1,
+                workId = WorkId("urn:mixu:work:adr043-spoiler-test"),
+                editionId = gEdition,
+                graphVersion = "1.0.0",
+                revealAnchorMapVersion = 1,
+                checksumSha256 = checksum,
+                packageFormat = "sqlite+zstd",
+                publicationPolicy = "AUTHORIZED_PUBLIC",
+                sourceExcerptPolicy = "LOCATOR_ONLY",
+                createdAt = "2026-11-25T00:00:00Z",
+                copyrightBasis = "SYNTHETIC",
+                provenance = Provenance(validatorVersion = "1.0.0"),
+            )
+
+        val eSubject = EntityId("entity:subject")
+        val eMask = EntityId("entity:mask")
+        val eChronicle = EntityId("entity:chronicle")
+        val eMotif = EntityId("entity:motif_bell")
+
+        val entities =
+            listOf(
+                Entity(eSubject, EntityType.PERSON, firstReveal = 1, revealCharEnd = 40),
+                Entity(eMask, EntityType.PERSONA, firstReveal = 2, revealCharEnd = 60),
+                Entity(eChronicle, EntityType.TEXT_WORK, firstReveal = 4, revealCharEnd = 120),
+                Entity(eMotif, EntityType.MOTIF, firstReveal = 5, revealCharEnd = 180),
+            )
+        val names =
+            listOf(
+                EntityName(
+                    NameId("n:sub"),
+                    eSubject,
+                    "Investigator Lin",
+                    1,
+                    NameKind.CANONICAL,
+                    revealCharEnd = 40,
+                ),
+                EntityName(
+                    NameId("n:msk"),
+                    eMask,
+                    "Harbor Courier",
+                    2,
+                    NameKind.ALIAS,
+                    revealCharEnd = 60,
+                ),
+                EntityName(
+                    NameId("n:chr"),
+                    eChronicle,
+                    "Old Parish Ledger",
+                    4,
+                    NameKind.TITLE,
+                    revealCharEnd = 120,
+                ),
+                EntityName(
+                    NameId("n:mtf"),
+                    eMotif,
+                    "Seven Bells Motif",
+                    5,
+                    NameKind.CANONICAL,
+                    revealCharEnd = 180,
+                ),
+            )
+        val citedAssertion =
+            Assertion(
+                assertionId = AssertionId("asr:cited_work"),
+                subjectId = eSubject,
+                predicate = "consulted_record",
+                objectRef = ObjectRef.Literal("entry_1892"),
+                qualifier = mapOf("diegetic_layer" to "REFERENCE_TEXT", "doc_id" to "doc:parish"),
+                attribution = Attribution(AttributionKind.NARRATOR, speakerId = eChronicle),
+                firstReveal = 3,
+                revealCharEnd = 80,
+                evidenceAnchorId = EvidenceAnchorId("anc:cited"),
+                epistemicStatus = EpistemicStatus.OBSERVED,
+            )
+        val hypLink =
+            IdentityLink(
+                linkId = LinkId("lnk:hyp_adr043"),
+                entityIds = listOf(eSubject, eMask),
+                kind = IdentityLinkKind.CANDIDATE,
+                firstReveal = 4,
+                revealCharEnd = 150,
+                epistemicStatus = EpistemicStatus.OBSERVED,
+                hypothesisFrame = "theory:courier_mask",
+            )
+        val pack =
+            GraphPack(
+                manifest = manifest,
+                entities = entities,
+                names = names,
+                assertions = listOf(citedAssertion),
+                identityLinks = listOf(hypLink),
+            )
+
+        // At ordinal 3, citedAssertion's documentary speaker TEXT_WORK (ordinal 4) is NOT disclosed yet -> redacted!
+        val h3 = Horizon.initial(editionId, RevealOrdinal(3), viewCharOffset = 200)
+        val view3 = RedactionPolicy.evaluateGraphPack(pack, horizon = h3)
+        assertTrue(view3.assertions.isEmpty())
+        assertTrue(view3.identityLinks.isEmpty())
+        assertFalse(
+            view3.entities.any {
+                it.entity.entityId == eChronicle ||
+                    it.entity.entityId == eMotif
+            },
+        )
+
+        // At (4, 149): TEXT_WORK revealed -> citedAssertion unlocks, hypLink still before revealCharEnd 150
+        val h4BeforeLink = Horizon.initial(editionId, RevealOrdinal(4), viewCharOffset = 149)
+        val view4BeforeLink = RedactionPolicy.evaluateGraphPack(pack, horizon = h4BeforeLink)
+        assertEquals(
+            listOf(citedAssertion.assertionId),
+            view4BeforeLink.assertions.map {
+                it.assertion.assertionId
+            },
+        )
+        assertTrue(view4BeforeLink.identityLinks.isEmpty())
+
+        // At (4, 150): hypothesisFrame link unlocks WITHOUT collapsing DSU clusters; MOTIF (5, 180) stays hidden
+        val h4AtLink = Horizon.initial(editionId, RevealOrdinal(4), viewCharOffset = 150)
+        val view4AtLink = RedactionPolicy.evaluateGraphPack(pack, horizon = h4AtLink)
+        assertEquals(1, view4AtLink.hypothesizedIdentityLinks.size)
+        assertTrue(view4AtLink.collapsibleIdentityLinks.isEmpty())
+        assertEquals(
+            eMask,
+            view4AtLink.entities.first { it.entity.entityId == eMask }.resolvedEntityId,
+        )
+        assertEquals(
+            eMask,
+            RedactionPolicy.resolveCanonicalEntityId(eMask, listOf(hypLink), h4AtLink),
+        )
+        assertFalse(view4AtLink.entities.any { it.entity.entityId == eMotif })
+
+        // At (5, 179) -> MOTIF hidden; at (5, 180) -> MOTIF revealed
+        val view5Before =
+            RedactionPolicy.evaluateGraphPack(
+                pack,
+                horizon = Horizon.initial(editionId, RevealOrdinal(5), viewCharOffset = 179),
+            )
+        assertFalse(view5Before.entities.any { it.entity.entityId == eMotif })
+        val view5At =
+            RedactionPolicy.evaluateGraphPack(
+                pack,
+                horizon = Horizon.initial(editionId, RevealOrdinal(5), viewCharOffset = 180),
+            )
+        assertTrue(
+            view5At.entities.any {
+                it.entity.entityId == eMotif &&
+                    it.entity.entityType == EntityType.MOTIF
+            },
+        )
+    }
 }
