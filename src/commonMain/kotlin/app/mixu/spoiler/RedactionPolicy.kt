@@ -12,6 +12,7 @@ import app.mixu.graph.ObjectRef
 import app.mixu.graph.RevealedAssertion
 import app.mixu.graph.RevealedEntity
 import app.mixu.graph.RevealedGraphView
+import app.mixu.graph.computeConditionalIdentityClusters
 
 /**
  * Filter decision on whether an item is visible or redacted.
@@ -25,13 +26,14 @@ sealed interface RedactionResult<out T> {
 }
 
 /**
- * Search hit candidate with associated identifier and the reveal ordinal at which
+ * Search hit candidate with associated identifier and the reveal boundary at which
  * the matching disclosure was made.
  */
 data class CandidateSearchHit<T>(
     val targetId: String,
     val matchedRevealOrdinal: RevealOrdinal,
     val payload: T,
+    val matchedRevealCharEnd: Int? = null,
 )
 
 /**
@@ -50,17 +52,19 @@ object RedactionPolicy {
         horizon: Horizon,
     ): RedactionResult<RevealedEntity> {
         val viewOrdinal = horizon.graphViewPosition.value
-        if (entity.firstReveal > viewOrdinal) {
+        if (!horizon.isDisclosedAtView(entity.firstReveal, entity.revealCharEnd)) {
             return RedactionResult.Redacted
         }
 
         val revealedNames =
-            names.filter {
-                it.entityId == entity.entityId && it.firstReveal <= viewOrdinal
-            }
+            names
+                .filter {
+                    it.entityId == entity.entityId &&
+                        horizon.isDisclosedAtView(it.firstReveal, it.revealCharEnd)
+                }.sortedWith(EntityName.STABLE_COMPARATOR)
         val canonicalName =
             revealedNames.find { it.nameId == entity.canonicalNameId }
-                ?: revealedNames.minByOrNull { it.firstReveal }
+                ?: revealedNames.minWithOrNull(EntityName.STABLE_COMPARATOR)
 
         return RedactionResult.Visible(
             RevealedEntity(
@@ -68,19 +72,14 @@ object RedactionPolicy {
                 canonicalName = canonicalName,
                 allRevealedNames = revealedNames,
                 viewOrdinal = viewOrdinal,
+                viewCharOffset = horizon.viewCharOffset,
             ),
         )
     }
 
     /**
      * Evaluates whether an assertion/relation is visible and computes its effective epistemic status
-     * as of the horizon's view ordinal.
-     *
-     * Invariants enforced:
-     * 1. Assertion firstReveal <= viewOrdinal
-     * 2. Subject entity is visible at viewOrdinal
-     * 3. Object entity (if Entity ref) is visible at viewOrdinal
-     * 4. Transitions later than viewOrdinal are ignored; transitions <= viewOrdinal determine status.
+     * as of the horizon's view cursor.
      */
     fun evaluateAssertion(
         assertion: Assertion,
@@ -92,16 +91,18 @@ object RedactionPolicy {
     ): RedactionResult<RevealedAssertion> {
         val viewOrdinal = horizon.graphViewPosition.value
 
-        if (assertion.firstReveal > viewOrdinal) {
+        if (!horizon.isDisclosedAtView(assertion.firstReveal, assertion.revealCharEnd)) {
             return RedactionResult.Redacted
         }
 
-        if (subject.firstReveal > viewOrdinal) {
+        if (!horizon.isDisclosedAtView(subject.firstReveal, subject.revealCharEnd)) {
             return RedactionResult.Redacted
         }
 
         if (assertion.objectRef is ObjectRef.Entity) {
-            if (objectEntity == null || objectEntity.firstReveal > viewOrdinal) {
+            if (objectEntity == null ||
+                !horizon.isDisclosedAtView(objectEntity.firstReveal, objectEntity.revealCharEnd)
+            ) {
                 return RedactionResult.Redacted
             }
         }
@@ -113,16 +114,31 @@ object RedactionPolicy {
                 } else {
                     speaker
                 }
-            if (resolvedSpeaker == null || resolvedSpeaker.firstReveal > viewOrdinal) {
+            if (resolvedSpeaker == null) {
+                return RedactionResult.Redacted
+            }
+            val speakerDisclosed =
+                horizon.isDisclosedAtView(
+                    resolvedSpeaker.firstReveal,
+                    resolvedSpeaker.revealCharEnd,
+                )
+            if (!speakerDisclosed) {
                 return RedactionResult.Redacted
             }
         }
 
+        val transitionOrder =
+            compareBy<AssertionTransition>(
+                { it.revealOrdinal },
+                { it.revealCharEnd ?: 0 },
+                { it.transitionId.value },
+            )
         val validTransitions =
             transitions
                 .filter {
-                    it.assertionId == assertion.assertionId && it.revealOrdinal <= viewOrdinal
-                }.sortedBy { it.revealOrdinal }
+                    it.assertionId == assertion.assertionId &&
+                        horizon.isDisclosedAtView(it.revealOrdinal, it.revealCharEnd)
+                }.sortedWith(transitionOrder)
 
         val activeTransition = validTransitions.lastOrNull()
         val currentStatus = activeTransition?.status ?: assertion.epistemicStatus
@@ -133,6 +149,7 @@ object RedactionPolicy {
                 currentStatus = currentStatus,
                 activeTransition = activeTransition,
                 viewOrdinal = viewOrdinal,
+                viewCharOffset = horizon.viewCharOffset,
             ),
         )
     }
@@ -144,36 +161,36 @@ object RedactionPolicy {
         link: IdentityLink,
         horizon: Horizon,
     ): RedactionResult<IdentityLink> {
-        val viewOrdinal = horizon.graphViewPosition.value
-        if (link.firstReveal > viewOrdinal) {
+        if (!horizon.isDisclosedAtView(link.firstReveal, link.revealCharEnd)) {
             return RedactionResult.Redacted
         }
         return RedactionResult.Visible(link)
     }
 
     /**
-     * Resolves the canonical entity ID among linked personas at the current horizon.
-     * Before the link's firstReveal ordinal, the entities remain isolated and each resolves to itself.
+     * Resolves the canonical entity ID among collapsible linked personas at the current horizon.
+     * Hypothesized/framed links (INV-3) and undisclosed links never collapse entities.
      */
     fun resolveCanonicalEntityId(
         entityId: EntityId,
         links: List<IdentityLink>,
         horizon: Horizon,
     ): EntityId {
-        val viewOrdinal = horizon.graphViewPosition.value
-        val validLinks =
+        val collapsibleLinks =
             links.filter {
-                it.firstReveal <= viewOrdinal && it.entityIds.contains(entityId)
+                horizon.isDisclosedAtView(it.firstReveal, it.revealCharEnd) && it.isCollapsible()
             }
-        if (validLinks.isEmpty()) return entityId
+        if (collapsibleLinks.none { it.entityIds.contains(entityId) }) {
+            return entityId
+        }
 
         val connected = mutableSetOf(entityId)
         val queue = ArrayDeque<EntityId>()
         queue.add(entityId)
         while (queue.isNotEmpty()) {
             val curr = queue.removeFirst()
-            for (link in links) {
-                if (link.firstReveal <= viewOrdinal && link.entityIds.contains(curr)) {
+            for (link in collapsibleLinks) {
+                if (link.entityIds.contains(curr)) {
                     for (other in link.entityIds) {
                         if (connected.add(other)) {
                             queue.add(other)
@@ -196,14 +213,39 @@ object RedactionPolicy {
         val viewOrdinal = horizon.graphViewPosition.value
         val entityMap = pack.entities.associateBy { it.entityId }
 
-        val visibleEntities = mutableListOf<RevealedEntity>()
+        val rawVisibleEntities = mutableListOf<RevealedEntity>()
         for (entity in pack.entities) {
             when (val eval = evaluateEntity(entity, pack.names, horizon)) {
-                is RedactionResult.Visible -> visibleEntities.add(eval.item)
+                is RedactionResult.Visible -> rawVisibleEntities.add(eval.item)
                 RedactionResult.Redacted -> Unit
             }
         }
-        visibleEntities.sortWith(RevealedEntity.STABLE_COMPARATOR)
+
+        val visibleEntityIds = rawVisibleEntities.map { it.entity.entityId }.toSet()
+        val combinedLinks =
+            (pack.identityLinks + links)
+                .distinctBy { it.linkId }
+                .sortedWith(IdentityLink.STABLE_COMPARATOR)
+        val visibleLinks =
+            combinedLinks.filter { link ->
+                horizon.isDisclosedAtView(link.firstReveal, link.revealCharEnd) &&
+                    link.entityIds.all { it in visibleEntityIds }
+            }
+        val resolution =
+            computeConditionalIdentityClusters(
+                visibleEntities = rawVisibleEntities.map { it.entity },
+                visibleLinks = visibleLinks,
+            )
+
+        val visibleEntities =
+            rawVisibleEntities
+                .map { revealed ->
+                    revealed.copy(
+                        resolvedEntityId =
+                            resolution.resolvedByEntity[revealed.entity.entityId]
+                                ?: revealed.entity.entityId,
+                    )
+                }.sortedWith(RevealedEntity.STABLE_COMPARATOR)
 
         val visibleAssertions = mutableListOf<RevealedAssertion>()
         for (assertion in pack.assertions) {
@@ -233,6 +275,11 @@ object RedactionPolicy {
             viewOrdinal = viewOrdinal,
             entities = visibleEntities,
             assertions = visibleAssertions,
+            viewCharOffset = horizon.viewCharOffset,
+            identityLinks = visibleLinks,
+            collapsibleIdentityLinks = resolution.collapsibleLinks,
+            hypothesizedIdentityLinks = resolution.hypothesizedLinks,
+            dsuClusters = resolution.dsuClusters,
         )
     }
 
@@ -242,12 +289,11 @@ object RedactionPolicy {
     fun <T> filterSearchHits(
         candidates: List<CandidateSearchHit<T>>,
         horizon: Horizon,
-    ): List<T> {
-        val viewOrdinal = horizon.graphViewPosition
-        return candidates
-            .filter { it.matchedRevealOrdinal <= viewOrdinal }
-            .map { it.payload }
-    }
+    ): List<T> =
+        candidates
+            .filter {
+                horizon.isDisclosedAtView(it.matchedRevealOrdinal.value, it.matchedRevealCharEnd)
+            }.map { it.payload }
 
     /**
      * Computes the visible count of elements without leaking total pack size.
@@ -259,4 +305,12 @@ object RedactionPolicy {
         val viewOrdinal = horizon.graphViewPosition.value
         return ordinals.count { it <= viewOrdinal }
     }
+
+    /**
+     * Computes the visible count of (ordinal, revealCharEnd) pairs at the current view cursor.
+     */
+    fun countVisibleDisclosures(
+        disclosures: Iterable<Pair<Int, Int?>>,
+        horizon: Horizon,
+    ): Int = disclosures.count { (ordinal, charEnd) -> horizon.isDisclosedAtView(ordinal, charEnd) }
 }
