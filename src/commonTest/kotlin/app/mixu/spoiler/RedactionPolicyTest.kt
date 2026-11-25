@@ -12,12 +12,21 @@ import app.mixu.graph.EntityName
 import app.mixu.graph.EntityType
 import app.mixu.graph.EpistemicStatus
 import app.mixu.graph.EvidenceAnchorId
+import app.mixu.graph.GraphPack
+import app.mixu.graph.GraphPackManifest
+import app.mixu.graph.IdentityLink
+import app.mixu.graph.IdentityLinkKind
+import app.mixu.graph.LinkId
 import app.mixu.graph.NameId
 import app.mixu.graph.NameKind
 import app.mixu.graph.ObjectRef
+import app.mixu.graph.Provenance
+import app.mixu.graph.WorkId
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class RedactionPolicyTest {
@@ -213,5 +222,228 @@ class RedactionPolicyTest {
         val count = RedactionPolicy.countVisible(ordinals, horizon)
         assertEquals(2, count)
         assertTrue(count < ordinals.size)
+    }
+
+    @Test
+    fun charOffsetGatesDisclosuresWithinSameOrdinal_INV7() {
+        val earlyName =
+            EntityName(
+                nameId = NameId("name:alias:early"),
+                entityId = holmes,
+                displayText = "Lodger",
+                firstReveal = 2,
+                nameKind = NameKind.DESCRIPTION,
+                revealCharEnd = 100,
+            )
+        val lateName =
+            EntityName(
+                nameId = NameId("name:alias:late"),
+                entityId = holmes,
+                displayText = "Consulting Detective",
+                firstReveal = 2,
+                nameKind = NameKind.CANONICAL,
+                revealCharEnd = 450,
+            )
+        val entity = holmesEntity.copy(revealCharEnd = 90, canonicalNameId = lateName.nameId)
+        val beforeLate = Horizon.initial(editionId, RevealOrdinal(2), viewCharOffset = 200)
+        val resBefore =
+            RedactionPolicy.evaluateEntity(
+                entity,
+                listOf(earlyName, lateName),
+                beforeLate,
+            )
+        assertIs<RedactionResult.Visible<app.mixu.graph.RevealedEntity>>(resBefore)
+        assertEquals("Lodger", resBefore.item.canonicalName?.displayText)
+        assertEquals(listOf(earlyName), resBefore.item.allRevealedNames)
+
+        val atLate = beforeLate.withViewCharOffset(450)
+        val resAtLate = RedactionPolicy.evaluateEntity(entity, listOf(earlyName, lateName), atLate)
+        assertIs<RedactionResult.Visible<app.mixu.graph.RevealedEntity>>(resAtLate)
+        assertEquals("Consulting Detective", resAtLate.item.canonicalName?.displayText)
+        assertEquals(2, resAtLate.item.allRevealedNames.size)
+
+        val hitBefore =
+            CandidateSearchHit("hit:1", RevealOrdinal(2), "early", matchedRevealCharEnd = 120)
+        val hitAfter =
+            CandidateSearchHit("hit:2", RevealOrdinal(2), "late", matchedRevealCharEnd = 300)
+        val filtered = RedactionPolicy.filterSearchHits(listOf(hitBefore, hitAfter), beforeLate)
+        assertEquals(listOf("early"), filtered)
+        assertFalse(beforeLate.isPermitted(RevealOrdinal(2), editionId, targetCharEnd = 300))
+        assertTrue(beforeLate.isPermitted(RevealOrdinal(2), editionId, targetCharEnd = 120))
+    }
+
+    @Test
+    fun conditionalDsuIgnoresClaimedAndFramedLinks_INV3() {
+        val claimed =
+            IdentityLink(
+                linkId = LinkId("link:claimed"),
+                entityIds = listOf(holmes, watson),
+                kind = IdentityLinkKind.CANDIDATE,
+                firstReveal = 3,
+                epistemicStatus = EpistemicStatus.CLAIMED,
+            )
+        val framed =
+            IdentityLink(
+                linkId = LinkId("link:framed"),
+                entityIds = listOf(watson, lestrade),
+                kind = IdentityLinkKind.CONFIRMED,
+                firstReveal = 3,
+                epistemicStatus = EpistemicStatus.OBSERVED,
+                frameId = "frame:hyp-1",
+            )
+        val observed =
+            IdentityLink(
+                linkId = LinkId("link:observed"),
+                entityIds = listOf(holmes, lestrade),
+                kind = IdentityLinkKind.CONFIRMED,
+                firstReveal = 5,
+                epistemicStatus = EpistemicStatus.OBSERVED,
+            )
+
+        val links = listOf(claimed, framed, observed)
+        val h4 = Horizon.initial(editionId, RevealOrdinal(4))
+        assertEquals(holmes, RedactionPolicy.resolveCanonicalEntityId(holmes, links, h4))
+        assertEquals(watson, RedactionPolicy.resolveCanonicalEntityId(watson, links, h4))
+
+        val h5 = Horizon.initial(editionId, RevealOrdinal(5))
+        assertEquals(holmes, RedactionPolicy.resolveCanonicalEntityId(lestrade, links, h5))
+        assertEquals(watson, RedactionPolicy.resolveCanonicalEntityId(watson, links, h5))
+    }
+
+    @Test
+    fun evaluateGraphPackEnforcesTruncationEquivalence_PSpoiler09() {
+        val gEdition = app.mixu.graph.EditionId(editionId.value)
+        val checksum = "0123456789abcdef".repeat(4)
+        val manifest =
+            GraphPackManifest(
+                graphSchemaVersion = 1,
+                workId = WorkId("urn:mixu:work:trunc-test"),
+                editionId = gEdition,
+                graphVersion = "1.0.0",
+                revealAnchorMapVersion = 1,
+                checksumSha256 = checksum,
+                packageFormat = "sqlite+zstd",
+                publicationPolicy = "AUTHORIZED_PUBLIC",
+                sourceExcerptPolicy = "LOCATOR_ONLY",
+                createdAt = "2026-11-25T00:00:00Z",
+                copyrightBasis = "SYNTHETIC",
+                provenance = Provenance(validatorVersion = "1.0.0"),
+            )
+        val watsonNameId = NameId("name:watson")
+        val lestradeNameId = NameId("name:lestrade")
+        val eA =
+            Entity(
+                entityId = holmes,
+                entityType = EntityType.PERSON,
+                firstReveal = 1,
+                revealCharEnd = 50,
+                canonicalNameId = holmesEarlyAlias,
+            )
+        val eB =
+            Entity(
+                entityId = watson,
+                entityType = EntityType.PERSON,
+                firstReveal = 1,
+                revealCharEnd = 100,
+                canonicalNameId = watsonNameId,
+            )
+        val eFuture =
+            Entity(
+                entityId = lestrade,
+                entityType = EntityType.PERSON,
+                firstReveal = 6,
+                canonicalNameId = lestradeNameId,
+            )
+        val names =
+            listOf(
+                EntityName(
+                    nameId = holmesEarlyAlias,
+                    entityId = holmes,
+                    displayText = "Stranger-A",
+                    firstReveal = 1,
+                    nameKind = NameKind.DESCRIPTION,
+                    revealCharEnd = 50,
+                ),
+                EntityName(
+                    nameId = holmesCanonical,
+                    entityId = holmes,
+                    displayText = "Late Reveal",
+                    firstReveal = 1,
+                    nameKind = NameKind.CANONICAL,
+                    revealCharEnd = 400,
+                ),
+                EntityName(
+                    nameId = watsonNameId,
+                    entityId = watson,
+                    displayText = "Companion-B",
+                    firstReveal = 1,
+                    nameKind = NameKind.CANONICAL,
+                    revealCharEnd = 100,
+                ),
+                EntityName(
+                    nameId = lestradeNameId,
+                    entityId = lestrade,
+                    displayText = "Future Inspector",
+                    firstReveal = 6,
+                    nameKind = NameKind.CANONICAL,
+                ),
+            )
+        val aEarly =
+            Assertion(
+                assertionId = AssertionId("assertion:early"),
+                subjectId = holmes,
+                predicate = "met",
+                objectRef = ObjectRef.Entity(watson),
+                attribution = Attribution(AttributionKind.OBSERVATION),
+                firstReveal = 1,
+                revealCharEnd = 150,
+                evidenceAnchorId = EvidenceAnchorId("anchor:1"),
+                epistemicStatus = EpistemicStatus.OBSERVED,
+            )
+        val aLate =
+            Assertion(
+                assertionId = AssertionId("assertion:late"),
+                subjectId = holmes,
+                predicate = "suspects",
+                objectRef = ObjectRef.Entity(lestrade),
+                attribution = Attribution(AttributionKind.NARRATOR),
+                firstReveal = 6,
+                evidenceAnchorId = EvidenceAnchorId("anchor:2"),
+                epistemicStatus = EpistemicStatus.CLAIMED,
+            )
+        val futLink =
+            IdentityLink(
+                linkId = LinkId("link:fut"),
+                entityIds = listOf(holmes, lestrade),
+                kind = IdentityLinkKind.CONFIRMED,
+                firstReveal = 6,
+            )
+        val fullPack =
+            GraphPack(
+                manifest = manifest,
+                entities = listOf(eA, eB, eFuture),
+                names = names,
+                assertions = listOf(aEarly, aLate),
+                identityLinks = listOf(futLink),
+            )
+        val truncatedPack =
+            GraphPack(
+                manifest = manifest,
+                entities = listOf(eA, eB),
+                names =
+                    names.filter {
+                        it.firstReveal <= 1 &&
+                            (it.revealCharEnd == null || it.revealCharEnd!! <= 200)
+                    },
+                assertions = listOf(aEarly),
+            )
+
+        val horizon = Horizon.initial(editionId, RevealOrdinal(1), viewCharOffset = 200)
+        val fullView = RedactionPolicy.evaluateGraphPack(fullPack, horizon = horizon)
+        val truncatedView = RedactionPolicy.evaluateGraphPack(truncatedPack, horizon = horizon)
+
+        assertEquals(truncatedView, fullView)
+        val holmesView = fullView.entities.find { it.entity.entityId == holmes }
+        assertNull(holmesView?.allRevealedNames?.find { it.nameId == holmesCanonical })
     }
 }

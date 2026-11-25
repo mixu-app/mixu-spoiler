@@ -1515,4 +1515,84 @@ class AdversarialInvariantSuiteTest {
             "Naive stub unexpectedly passed forbidden check! Leaked items expected.",
         )
     }
+
+    @Test
+    fun testConditionalDsuRewindAndFrameIsolation_INV3() {
+        val advEdition = EditionId("urn:mixu:test:adr042-adv")
+        val entityA = EntityId("entity:courier")
+        val entityB = EntityId("entity:clerk")
+        val entityC = EntityId("entity:heir")
+        val pack =
+            GraphPack(
+                manifest =
+                    GraphPackManifest(
+                        graphSchemaVersion = 1,
+                        workId = WorkId("urn:mixu:work:adr042-adv"),
+                        editionId = app.mixu.graph.EditionId(advEdition.value),
+                        graphVersion = "1.0.0",
+                        revealAnchorMapVersion = 1,
+                        checksumSha256 = TEST_CHECKSUM,
+                        packageFormat = "sqlite+zstd",
+                        publicationPolicy = "AUTHORIZED_PUBLIC",
+                        sourceExcerptPolicy = "LOCATOR_ONLY",
+                        createdAt = "2026-11-25T00:00:00Z",
+                        copyrightBasis = "SYNTHETIC",
+                        provenance = Provenance(validatorVersion = "1.0.0"),
+                    ),
+                entities =
+                    listOf(
+                        Entity(entityA, EntityType.PERSON, firstReveal = 1),
+                        Entity(entityB, EntityType.PERSON, firstReveal = 1),
+                        Entity(entityC, EntityType.PERSON, firstReveal = 2),
+                    ),
+                names =
+                    listOf(
+                        EntityName(NameId("n:a"), entityA, "Courier", 1, NameKind.DESCRIPTION),
+                        EntityName(NameId("n:b"), entityB, "Night Clerk", 1, NameKind.CANONICAL),
+                        EntityName(NameId("n:c"), entityC, "Missing Heir", 2, NameKind.CANONICAL),
+                    ),
+                assertions = emptyList(),
+                identityLinks =
+                    listOf(
+                        IdentityLink(
+                            linkId = LinkId("l:claimed"),
+                            entityIds = listOf(entityA, entityB),
+                            kind = IdentityLinkKind.CANDIDATE,
+                            firstReveal = 2,
+                            epistemicStatus = EpistemicStatus.CLAIMED,
+                        ),
+                        IdentityLink(
+                            linkId = LinkId("l:framed"),
+                            entityIds = listOf(entityB, entityC),
+                            kind = IdentityLinkKind.CONFIRMED,
+                            firstReveal = 3,
+                            epistemicStatus = EpistemicStatus.OBSERVED,
+                            frameId = "frame:detective-alt",
+                        ),
+                        IdentityLink(
+                            linkId = LinkId("l:observed"),
+                            entityIds = listOf(entityA, entityC),
+                            kind = IdentityLinkKind.CONFIRMED,
+                            firstReveal = 5,
+                            epistemicStatus = EpistemicStatus.OBSERVED,
+                        ),
+                    ),
+            )
+
+        val advanced = Horizon.initial(advEdition, RevealOrdinal(5))
+        val viewAt5 = RedactionPolicy.evaluateGraphPack(pack, horizon = advanced)
+        val mergedIds = viewAt5.entities.associate { it.entity.entityId to it.resolvedEntityId }
+        assertEquals(mergedIds[entityA], mergedIds[entityC])
+        assertNotEquals(mergedIds[entityA], mergedIds[entityB])
+        assertEquals(1, viewAt5.collapsibleIdentityLinks.size)
+        assertEquals(2, viewAt5.hypothesizedIdentityLinks.size)
+
+        val rewound = advanced.rewindGraphView(RevealOrdinal(3))
+        val viewAt3 = RedactionPolicy.evaluateGraphPack(pack, horizon = rewound)
+        val rewoundIds = viewAt3.entities.associate { it.entity.entityId to it.resolvedEntityId }
+        assertEquals(entityA, rewoundIds[entityA])
+        assertEquals(entityB, rewoundIds[entityB])
+        assertEquals(entityC, rewoundIds[entityC])
+        assertTrue(viewAt3.collapsibleIdentityLinks.isEmpty())
+    }
 }

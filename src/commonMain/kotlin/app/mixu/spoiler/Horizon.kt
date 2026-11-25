@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package app.mixu.spoiler
 
+import app.mixu.graph.isDisclosedAt
 import kotlin.jvm.JvmInline
 
 /**
@@ -61,10 +62,16 @@ data class Horizon(
     val readingPosition: RevealOrdinal,
     val knowledgeHorizon: RevealOrdinal,
     val graphViewPosition: RevealOrdinal = knowledgeHorizon,
+    val viewCharOffset: Int? = null,
 ) {
     init {
         require(graphViewPosition <= knowledgeHorizon) {
             "graphViewPosition ($graphViewPosition) cannot exceed knowledgeHorizon ($knowledgeHorizon)"
+        }
+        if (viewCharOffset != null) {
+            require(viewCharOffset >= 0) {
+                "viewCharOffset must be non-negative, got: $viewCharOffset"
+            }
         }
     }
 
@@ -72,12 +79,14 @@ data class Horizon(
         fun initial(
             editionId: EditionId,
             initialOrdinal: RevealOrdinal = RevealOrdinal(0),
+            viewCharOffset: Int? = null,
         ): Horizon =
             Horizon(
                 editionId = editionId,
                 readingPosition = initialOrdinal,
                 knowledgeHorizon = initialOrdinal,
                 graphViewPosition = initialOrdinal,
+                viewCharOffset = viewCharOffset,
             )
     }
 
@@ -143,16 +152,39 @@ data class Horizon(
     }
 
     /**
-     * Decides whether candidate information at [targetReveal] within [targetEdition] is permitted.
+     * Returns a copy with an explicit intra-ordinal character ceiling for INV-7 gating.
+     */
+    fun withViewCharOffset(offset: Int?): Horizon = copy(viewCharOffset = offset)
+
+    /**
+     * Checks whether a disclosure at ([itemOrdinal], [itemCharEnd]) is visible at the current
+     * graph view cursor ([graphViewPosition], [viewCharOffset]).
+     */
+    fun isDisclosedAtView(
+        itemOrdinal: Int,
+        itemCharEnd: Int? = null,
+    ): Boolean = isDisclosedAt(itemOrdinal, itemCharEnd, graphViewPosition.value, viewCharOffset)
+
+    /**
+     * Decides whether candidate information at ([targetReveal], [targetCharEnd]) within
+     * [targetEdition] is permitted under the unlocked knowledge horizon.
      */
     fun evaluate(
         targetReveal: RevealOrdinal,
         targetEdition: EditionId,
+        targetCharEnd: Int? = null,
     ): SpoilerDecision {
         if (targetEdition != editionId) {
             return SpoilerDecision.Deny(DenyReason.UNKNOWN_EDITION)
         }
-        if (targetReveal > knowledgeHorizon) {
+        val permitted =
+            isDisclosedAt(
+                targetReveal.value,
+                targetCharEnd,
+                knowledgeHorizon.value,
+                viewCharOffset,
+            )
+        if (!permitted) {
             return SpoilerDecision.Deny(DenyReason.BEYOND_HORIZON)
         }
         return SpoilerDecision.Allow
@@ -164,5 +196,6 @@ data class Horizon(
     fun isPermitted(
         targetReveal: RevealOrdinal,
         targetEdition: EditionId,
-    ): Boolean = evaluate(targetReveal, targetEdition) is SpoilerDecision.Allow
+        targetCharEnd: Int? = null,
+    ): Boolean = evaluate(targetReveal, targetEdition, targetCharEnd) is SpoilerDecision.Allow
 }
